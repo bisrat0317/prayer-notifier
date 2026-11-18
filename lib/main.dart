@@ -56,7 +56,7 @@ Future<void> initNotifications() async {
     guid: 'a3f1c2d4-5b6e-4f70-8a91-b2c3d4e5f607',
   );
   await plugin.initialize(
-    const InitializationSettings(android: android, windows: windows),
+    settings: const InitializationSettings(android: android, windows: windows),
   );
 
   if (Platform.isAndroid) {
@@ -71,7 +71,7 @@ String bodyFor(Prayer p) => 'የጸሎት ጊዜ ደርሷል · ${p.en}';
 
 // ---------- Android: OS-level daily scheduled notification ----------
 Future<void> scheduleAndroid(Prayer p) async {
-  await plugin.cancel(p.id);
+  await plugin.cancel(id: p.id);
   if (p.mode == Mode.off) return;
   final sound = p.mode == Mode.sound;
 
@@ -81,11 +81,11 @@ Future<void> scheduleAndroid(Prayer p) async {
   if (when.isBefore(now)) when = when.add(const Duration(days: 1));
 
   await plugin.zonedSchedule(
-    p.id,
-    p.am,
-    bodyFor(p),
-    when,
-    NotificationDetails(
+    id: p.id,
+    title: p.am,
+    body: bodyFor(p),
+    scheduledDate: when,
+    notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
         sound ? 'prayer_sound' : 'prayer_silent',
         sound ? 'Prayer times (sound)' : 'Prayer times (silent)',
@@ -103,10 +103,10 @@ Future<void> scheduleAndroid(Prayer p) async {
 Future<void> showNow(Prayer p) async {
   final sound = p.mode == Mode.sound;
   await plugin.show(
-    p.id,
-    p.am,
-    bodyFor(p),
-    NotificationDetails(
+    id: p.id,
+    title: p.am,
+    body: bodyFor(p),
+    notificationDetails: NotificationDetails(
       android: AndroidNotificationDetails(
         sound ? 'prayer_sound' : 'prayer_silent',
         sound ? 'Prayer times (sound)' : 'Prayer times (silent)',
