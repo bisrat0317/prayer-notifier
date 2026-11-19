@@ -193,34 +193,30 @@ NotificationDetails detailsFor(Prayer p) {
   final sound = p.mode == Mode.sound;
   return NotificationDetails(
     android: AndroidNotificationDetails(
-      // Sound mode = alarm style (full screen, repeating sound, X button).
-      // Silent mode = quiet heads-up popup at the top.
-      sound ? 'prayer_alarm_v2' : 'prayer_silent_v2',
-      sound ? 'Prayer alarm' : 'Prayer (silent popup)',
+      // Alarm and Silent behave the same (wake screen, full-screen page,
+      // dismiss button). Silent only turns the sound and vibration off.
+      // Channel settings can't change once created, so Silent has its own channel.
+      sound ? 'prayer_alarm_v2' : 'prayer_silent_v3',
+      sound ? 'Prayer alarm' : 'Prayer alarm (silent)',
       channelDescription: 'Notifications for the seven daily prayer hours',
-      importance: sound ? Importance.max : Importance.high,
-      priority: Priority.high,
+      importance: Importance.max,
+      priority: Priority.max,
       playSound: sound,
       enableVibration: sound,
-      category: sound
-          ? AndroidNotificationCategory.alarm
-          : AndroidNotificationCategory.reminder,
-      fullScreenIntent: sound,
-      audioAttributesUsage:
-          sound ? AudioAttributesUsage.alarm : AudioAttributesUsage.notification,
-      additionalFlags: sound ? Int32List.fromList(<int>[4]) : null, // insistent
-      timeoutAfter: sound ? 120000 : null,
+      category: AndroidNotificationCategory.alarm,
+      fullScreenIntent: true,
+      audioAttributesUsage: AudioAttributesUsage.alarm,
+      additionalFlags: sound ? Int32List.fromList(<int>[4]) : null, // repeat sound
+      timeoutAfter: 120000,
       visibility: NotificationVisibility.public,
       styleInformation: BigTextStyleInformation(bodyFor(p)),
-      actions: sound
-          ? <AndroidNotificationAction>[
-              const AndroidNotificationAction(
-                'dismiss',
-                '✕  Dismiss',
-                cancelNotification: true,
-              ),
-            ]
-          : null,
+      actions: <AndroidNotificationAction>[
+        const AndroidNotificationAction(
+          'dismiss',
+          '✕  Dismiss',
+          cancelNotification: true,
+        ),
+      ],
     ),
     windows: WindowsNotificationDetails(
       audio: sound
