@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -168,6 +169,18 @@ NextPrayer? findNext() {
   return NextPrayer(best, bestAt);
 }
 
+DateTime? prevPrayerTime() {
+  final now = DateTime.now();
+  DateTime? best;
+  for (final p in prayers) {
+    if (p.mode == Mode.off) continue;
+    var at = DateTime(now.year, now.month, now.day, p.hour, p.minute);
+    if (at.isAfter(now)) at = at.subtract(const Duration(days: 1));
+    if (best == null || at.isAfter(best)) best = at;
+  }
+  return best;
+}
+
 // ======================= NOTIFICATIONS =======================
 
 String bodyFor(Prayer p) => p.verse;
@@ -182,7 +195,8 @@ void onNotificationResponse(NotificationResponse r) {
     plugin.cancel(id: id);
     return;
   }
-  final match = prayers.where((e) => e.id == id);
+  final pid = id > 100 ? id - 100 : id;
+  final match = prayers.where((e) => e.id == pid);
   if (match.isEmpty) return;
   navigatorKey.currentState?.push(MaterialPageRoute(
     builder: (_) => AlarmScreen(prayer: match.first, exitApp: false),
@@ -274,6 +288,21 @@ Future<void> scheduleAndroid(Prayer p) async {
   );
 }
 
+// Snooze: one-time repeat of the alarm in 5 minutes (Android only).
+Future<void> snoozePrayer(Prayer p) async {
+  await plugin.cancel(id: p.id);
+  if (!Platform.isAndroid) return;
+  final when = tz.TZDateTime.now(tz.local).add(const Duration(minutes: 5));
+  await plugin.zonedSchedule(
+    id: p.id + 100,
+    title: p.am,
+    body: bodyFor(p),
+    scheduledDate: when,
+    notificationDetails: detailsFor(p),
+    androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+  );
+}
+
 Future<void> showNow(Prayer p) async {
   await plugin.show(
     id: p.id,
@@ -295,7 +324,8 @@ void main() async {
   if (Platform.isAndroid) {
     final d = await plugin.getNotificationAppLaunchDetails();
     if (d?.didNotificationLaunchApp ?? false) {
-      launchPrayerId = d?.notificationResponse?.id;
+      final nid = d?.notificationResponse?.id;
+      launchPrayerId = (nid != null && nid > 100) ? nid - 100 : nid;
     }
   }
 
@@ -318,6 +348,24 @@ void main() async {
   runApp(App(launchPrayerId: launchPrayerId));
 }
 
+ThemeData buildTheme() {
+  final scheme =
+      ColorScheme.fromSeed(seedColor: const Color(0xFF2C5240)).copyWith(
+    primary: const Color(0xFF1F4A38),
+    onPrimary: const Color(0xFFF7F5EE),
+    secondaryContainer: const Color(0xFFDDE8DF),
+    onSecondaryContainer: const Color(0xFF14281F),
+    surface: const Color(0xFFF7F5EE),
+    onSurface: const Color(0xFF1B3A2C),
+    outlineVariant: const Color(0xFFD9DED4),
+  );
+  return ThemeData(
+    useMaterial3: true,
+    colorScheme: scheme,
+    scaffoldBackgroundColor: const Color(0xFFF7F5EE),
+  );
+}
+
 class App extends StatelessWidget {
   final int? launchPrayerId;
   const App({super.key, this.launchPrayerId});
@@ -326,12 +374,218 @@ class App extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
         title: 'Prayer Notifier',
         navigatorKey: navigatorKey,
-        theme: ThemeData(
-          colorSchemeSeed: const Color(0xFF7B3F00),
-          useMaterial3: true,
-        ),
-        home: Home(launchPrayerId: launchPrayerId),
+        theme: buildTheme(),
+        // Skip the splash when the app was opened by a prayer alarm.
+        home: launchPrayerId != null
+            ? Home(launchPrayerId: launchPrayerId)
+            : const SplashScreen(next: Home()),
       );
+}
+
+// ======================= LOGO + SPLASH =======================
+
+class PrayerLogo extends StatelessWidget {
+  final double size;
+  const PrayerLogo({super.key, this.size = 160});
+
+  @override
+  Widget build(BuildContext context) =>
+      CustomPaint(size: Size(size, size), painter: _LogoPainter());
+}
+
+class _LogoPainter extends CustomPainter {
+  static const _angles = [0.0, 40.0, 80.0, 125.0, -40.0, -80.0, -125.0];
+  static const _gold = Color(0xFFC8AA6A);
+
+  static Path _cross() {
+    final path = Path()
+      ..addRect(const Rect.fromLTWH(96, 68, 8, 68))
+      ..addRect(const Rect.fromLTWH(72, 88, 56, 8));
+    void clover(Offset e, Offset d) {
+      final q = Offset(-d.dy, d.dx);
+      path.addOval(Rect.fromCircle(center: e + d * 1.0, radius: 5.5));
+      path.addOval(Rect.fromCircle(center: e + q * 5.2 - d * 2.0, radius: 4));
+      path.addOval(Rect.fromCircle(center: e - q * 5.2 - d * 2.0, radius: 4));
+    }
+
+    clover(const Offset(100, 68), const Offset(0, -1));
+    clover(const Offset(100, 136), const Offset(0, 1));
+    clover(const Offset(72, 92), const Offset(-1, 0));
+    clover(const Offset(128, 92), const Offset(1, 0));
+    return path;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final k = size.width / 200;
+    canvas.save();
+    canvas.scale(k, k);
+
+    // gold rim + green body
+    canvas.drawCircle(
+        const Offset(100, 100), 97, Paint()..color = const Color(0xFFB99A5B));
+    canvas.drawCircle(
+      const Offset(100, 100),
+      93,
+      Paint()
+        ..shader = const RadialGradient(
+          center: Alignment(0, -0.08),
+          radius: 1.0,
+          colors: [Color(0xFF33614A), Color(0xFF14281F)],
+        ).createShader(const Rect.fromLTWH(7, 7, 186, 186)),
+    );
+    canvas.drawCircle(
+      const Offset(100, 100),
+      72,
+      Paint()
+        ..color = _gold
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.8,
+    );
+
+    final points = [
+      for (final deg in _angles)
+        Offset(100 + 54 * math.sin(deg * math.pi / 180),
+            100 - 54 * math.cos(deg * math.pi / 180)),
+    ];
+
+    // gold rays pointing at the cross
+    const c = Offset(100, 94);
+    final rayPaint = Paint()..color = _gold;
+    for (final p in points) {
+      final v = c - p;
+      final u = v / v.distance;
+      final n = Offset(-u.dy, u.dx);
+      final b = p + u * 10.0;
+      final a1 = b + n * 4.2;
+      final a2 = b - n * 4.2;
+      canvas.drawPath(
+        Path()
+          ..moveTo(a1.dx, a1.dy)
+          ..lineTo(a2.dx, a2.dy)
+          ..lineTo(c.dx, c.dy)
+          ..close(),
+        rayPaint,
+      );
+    }
+
+    // cross with a soft green halo
+    final cross = _cross();
+    final halo = Paint()..color = const Color(0xFF3F7058);
+    canvas.drawPath(cross, halo);
+    canvas.drawPath(
+      cross,
+      Paint()
+        ..color = const Color(0xFF3F7058)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 5
+        ..strokeJoin = StrokeJoin.round,
+    );
+    canvas.drawPath(cross, Paint()..color = _gold);
+
+    // seven lamps
+    final flame = Path()
+      ..moveTo(0, -11)
+      ..cubicTo(3.4, -6.5, 3.6, -2.5, 0, 0.2)
+      ..cubicTo(-3.6, -2.5, -3.4, -6.5, 0, -11)
+      ..close();
+    final core = Path()
+      ..moveTo(0, -6.5)
+      ..cubicTo(1.4, -4, 1.4, -2, 0, -0.8)
+      ..cubicTo(-1.4, -2, -1.4, -4, 0, -6.5)
+      ..close();
+    final bowl = Path()
+      ..moveTo(-6.5, 0.8)
+      ..quadraticBezierTo(0, 9.5, 6.5, 0.8)
+      ..close();
+    for (final p in points) {
+      canvas.save();
+      canvas.translate(p.dx, p.dy);
+      canvas.drawCircle(
+          const Offset(0, -4), 9, Paint()..color = const Color(0x38FFB24A));
+      canvas.drawPath(bowl, Paint()..color = const Color(0xFFC98A3C));
+      canvas.drawPath(flame, Paint()..color = const Color(0xFFFFC766));
+      canvas.drawPath(core, Paint()..color = const Color(0xFFFFF0C0));
+      canvas.restore();
+    }
+
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class SplashScreen extends StatefulWidget {
+  final Widget next;
+  const SplashScreen({super.key, required this.next});
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  )..forward();
+
+  @override
+  void initState() {
+    super.initState();
+    Future.delayed(const Duration(milliseconds: 2400), () {
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(PageRouteBuilder(
+        transitionDuration: const Duration(milliseconds: 500),
+        pageBuilder: (_, __, ___) => widget.next,
+        transitionsBuilder: (_, anim, __, child) =>
+            FadeTransition(opacity: anim, child: child),
+      ));
+    });
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final fade = CurvedAnimation(parent: _c, curve: Curves.easeOut);
+    final scale = Tween<double>(begin: 0.85, end: 1.0)
+        .animate(CurvedAnimation(parent: _c, curve: Curves.easeOutBack));
+    return Scaffold(
+      backgroundColor: const Color(0xFFF7F5EE),
+      body: Center(
+        child: FadeTransition(
+          opacity: fade,
+          child: ScaleTransition(
+            scale: scale,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: const [
+                PrayerLogo(size: 176),
+                SizedBox(height: 28),
+                Text('ሰባቱ ጊዜ ጸሎት',
+                    style: TextStyle(
+                        fontSize: 32,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF1B3A2C))),
+                SizedBox(height: 8),
+                Text('PRAYER NOTIFIER',
+                    style: TextStyle(
+                        fontSize: 13,
+                        letterSpacing: 3.5,
+                        color: Color(0xFF5B6B60))),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // ======================= ALARM SCREEN =======================
@@ -340,6 +594,15 @@ class AlarmScreen extends StatelessWidget {
   final Prayer prayer;
   final bool exitApp;
   const AlarmScreen({super.key, required this.prayer, required this.exitApp});
+
+  Future<void> _snooze(BuildContext context) async {
+    await snoozePrayer(prayer);
+    if (exitApp) {
+      SystemNavigator.pop();
+    } else if (context.mounted) {
+      Navigator.of(context).pop();
+    }
+  }
 
   Future<void> _dismiss(BuildContext context) async {
     await plugin.cancel(id: prayer.id);
@@ -353,14 +616,14 @@ class AlarmScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF2B1600),
+      backgroundColor: const Color(0xFF0F1F18),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
             children: [
               const SizedBox(height: 16),
-              const Icon(Icons.alarm, size: 64, color: Colors.amber),
+              const PrayerLogo(size: 96),
               const SizedBox(height: 8),
               Text(prayer.am,
                   textAlign: TextAlign.center,
@@ -392,7 +655,7 @@ class AlarmScreen extends StatelessWidget {
                               style: const TextStyle(
                                   fontSize: 17,
                                   fontWeight: FontWeight.bold,
-                                  color: Colors.amber)),
+                                  color: Color(0xFFD8B96E))),
                         Text(t.body,
                             style: const TextStyle(
                                 fontSize: 17, color: Colors.white)),
@@ -417,6 +680,19 @@ class AlarmScreen extends StatelessWidget {
               ),
               const SizedBox(height: 6),
               const Text('Dismiss', style: TextStyle(color: Colors.white70)),
+              if (Platform.isAndroid) ...[
+                const SizedBox(height: 14),
+                OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Color(0xFF4E6B5C)),
+                    minimumSize: const Size(160, 44),
+                    shape: const StadiumBorder(),
+                  ),
+                  onPressed: () => _snooze(context),
+                  child: const Text('Snooze 5 min'),
+                ),
+              ],
             ],
           ),
         ),
@@ -629,6 +905,16 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
     return '$h:$m:$s';
   }
 
+  double _progress(NextPrayer n) {
+    final prev = prevPrayerTime();
+    if (prev == null) return 0;
+    final total = n.at.difference(prev).inSeconds;
+    if (total <= 0) return 0;
+    return (DateTime.now().difference(prev).inSeconds / total)
+        .clamp(0.0, 1.0)
+        .toDouble();
+  }
+
   Widget _nextCard(NextPrayer? next, ColorScheme scheme) {
     if (next == null) {
       return const Card(
@@ -646,7 +932,7 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
         child: Column(
           children: [
             Text('ቀጣይ ጸሎት · Next prayer',
-                style: TextStyle(color: scheme.onPrimary.withOpacity(0.8))),
+                style: TextStyle(color: const Color(0xFFE3B25E))),
             const SizedBox(height: 4),
             Text(next.prayer.am,
                 style: TextStyle(
@@ -663,6 +949,16 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
                     color: scheme.onPrimary)),
             Text('${next.prayer.clock24} · ሰዓት ${next.prayer.ethClock}',
                 style: TextStyle(color: scheme.onPrimary.withOpacity(0.8))),
+            const SizedBox(height: 12),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                value: _progress(next),
+                minHeight: 6,
+                backgroundColor: const Color(0xFF3E6B57),
+                valueColor: const AlwaysStoppedAnimation(Color(0xFFE3B25E)),
+              ),
+            ),
           ],
         ),
       ),
@@ -671,7 +967,8 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
 
   Widget _prayerCard(Prayer p, bool isNext, ColorScheme scheme) {
     return Card(
-      color: isNext ? scheme.primaryContainer : null,
+      elevation: 0,
+      color: isNext ? Colors.white : const Color(0xFFFBFAF5),
       shape: isNext
           ? RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(12),
@@ -810,7 +1107,21 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
     final next = findNext();
     final scheme = Theme.of(context).colorScheme;
     return Scaffold(
-      appBar: AppBar(title: const Text('ሰባቱ ጊዜ ጸሎት · Prayer Notifier')),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFFF7F5EE),
+        surfaceTintColor: Colors.transparent,
+        titleSpacing: 16,
+        title: Row(
+          children: const [
+            PrayerLogo(size: 32),
+            SizedBox(width: 12),
+            Flexible(
+              child: Text('ሰባቱ ጊዜ ጸሎት',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
