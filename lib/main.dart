@@ -36,6 +36,9 @@ class Prayer {
   int minutes; // minutes since midnight
   Mode mode;
   final List<UserText> texts = []; // prayers/psalms added by the user
+  String? soundUri; // Android: chosen ringtone (null = default alarm sound)
+  String soundName = 'Default alarm sound';
+  String winSound = 'alarm1'; // Windows: preset sound name
 
   Prayer(this.id, this.am, this.en, this.minutes, this.reason, this.verse,
       {this.mode = Mode.sound});
@@ -130,6 +133,9 @@ Future<void> loadPrayers() async {
   for (final p in prayers) {
     p.minutes = sp.getInt('t${p.id}') ?? p.minutes;
     p.mode = Mode.values[sp.getInt('m${p.id}') ?? Mode.sound.index];
+    p.soundUri = sp.getString('s${p.id}');
+    p.soundName = sp.getString('sn${p.id}') ?? p.soundName;
+    p.winSound = sp.getString('w${p.id}') ?? p.winSound;
     final raw = sp.getString('x${p.id}');
     if (raw != null) {
       try {
@@ -147,6 +153,13 @@ Future<void> savePrayer(Prayer p) async {
   final sp = await SharedPreferences.getInstance();
   await sp.setInt('t${p.id}', p.minutes);
   await sp.setInt('m${p.id}', p.mode.index);
+  if (p.soundUri == null) {
+    await sp.remove('s${p.id}');
+  } else {
+    await sp.setString('s${p.id}', p.soundUri!);
+  }
+  await sp.setString('sn${p.id}', p.soundName);
+  await sp.setString('w${p.id}', p.winSound);
   await sp.setString(
       'x${p.id}', jsonEncode(p.texts.map((t) => t.toJson()).toList()));
   if (Platform.isAndroid) await scheduleAndroid(p);
@@ -203,19 +216,46 @@ void onNotificationResponse(NotificationResponse r) {
   ));
 }
 
+const kDefaultAlarmUri = 'content://settings/system/alarm_alert';
+const _ringtoneChannel = MethodChannel('prayer/ringtone');
+
+int _stableHash(String s) {
+  var h = 7;
+  for (final c in s.codeUnits) {
+    h = (h * 31 + c) & 0x7fffffff;
+  }
+  return h;
+}
+
+// Opens Android's own ringtone picker (phone ringtones, alarms, notifications).
+Future<void> pickRingtone(Prayer p) async {
+  try {
+    final res = await _ringtoneChannel.invokeMethod<Map>(
+        'pick', {'current': p.soundUri ?? kDefaultAlarmUri});
+    if (res == null) return;
+    p.soundUri = res['uri'] as String?;
+    p.soundName = (res['title'] as String?) ?? 'Custom sound';
+  } on PlatformException {
+    // picker not available - keep the current sound
+  }
+}
+
 NotificationDetails detailsFor(Prayer p) {
   final sound = p.mode == Mode.sound;
+  final uri = p.soundUri ?? kDefaultAlarmUri;
   return NotificationDetails(
     android: AndroidNotificationDetails(
       // Alarm and Silent behave the same (wake screen, full-screen page,
       // dismiss button). Silent only turns the sound and vibration off.
       // Channel settings can't change once created, so Silent has its own channel.
-      sound ? 'prayer_alarm_v2' : 'prayer_silent_v3',
-      sound ? 'Prayer alarm' : 'Prayer alarm (silent)',
+      // one channel per ringtone (Android fixes a channel's sound once created)
+      sound ? 'prayer_alarm_${_stableHash(uri)}' : 'prayer_silent_v3',
+      sound ? 'Prayer alarm · ${p.soundName}' : 'Prayer alarm (silent)',
       channelDescription: 'Notifications for the seven daily prayer hours',
       importance: Importance.max,
       priority: Priority.max,
       playSound: sound,
+      sound: sound ? UriAndroidNotificationSound(uri) : null,
       enableVibration: sound,
       category: AndroidNotificationCategory.alarm,
       fullScreenIntent: true,
@@ -235,7 +275,9 @@ NotificationDetails detailsFor(Prayer p) {
     windows: WindowsNotificationDetails(
       audio: sound
           ? WindowsNotificationAudio.preset(
-              sound: WindowsNotificationSound.alarm1)
+              sound: WindowsNotificationSound.values.firstWhere(
+                  (v) => v.name == p.winSound,
+                  orElse: () => WindowsNotificationSound.alarm1))
           : WindowsNotificationAudio.silent(),
     ),
   );
@@ -331,7 +373,7 @@ void main() async {
 
   if (Platform.isWindows) {
     await windowManager.ensureInitialized();
-    await windowManager.setPreventClose(true); // X button hides to tray
+    await windowManager.setPreventClose(true); // lets us clean up the tray on close
     await windowManager.waitUntilReadyToShow(
       const WindowOptions(
         size: Size(480, 820),
@@ -588,6 +630,62 @@ class _SplashScreenState extends State<SplashScreen>
   }
 }
 
+// ======================= SHARED CARDS =======================
+
+class InfoCard extends StatelessWidget {
+  final String label;
+  final String text;
+  final bool quote;
+  final bool dark;
+  final Widget? footer;
+  const InfoCard({
+    super.key,
+    required this.label,
+    required this.text,
+    this.quote = false,
+    this.dark = false,
+    this.footer,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = dark ? const Color(0xFF16291F) : Colors.white;
+    final border = dark ? const Color(0xFF2E4A3C) : const Color(0xFFDDE3DA);
+    final labelColor =
+        dark ? const Color(0xFFD8B96E) : const Color(0xFF1F4A38);
+    final textColor =
+        dark ? const Color(0xFFF7F5EE) : const Color(0xFF1B3A2C);
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: bg,
+        border: Border.all(color: border),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: labelColor)),
+          const SizedBox(height: 6),
+          Text(text,
+              style: TextStyle(
+                  fontSize: quote ? 18 : 15,
+                  height: 1.55,
+                  fontStyle: quote ? FontStyle.italic : FontStyle.normal,
+                  color: textColor)),
+          if (footer != null) footer!,
+        ],
+      ),
+    );
+  }
+}
+
 // ======================= ALARM SCREEN =======================
 
 class AlarmScreen extends StatelessWidget {
@@ -595,8 +693,7 @@ class AlarmScreen extends StatelessWidget {
   final bool exitApp;
   const AlarmScreen({super.key, required this.prayer, required this.exitApp});
 
-  Future<void> _snooze(BuildContext context) async {
-    await snoozePrayer(prayer);
+  Future<void> _close(BuildContext context) async {
     if (exitApp) {
       SystemNavigator.pop();
     } else if (context.mounted) {
@@ -606,11 +703,12 @@ class AlarmScreen extends StatelessWidget {
 
   Future<void> _dismiss(BuildContext context) async {
     await plugin.cancel(id: prayer.id);
-    if (exitApp) {
-      SystemNavigator.pop();
-    } else if (context.mounted) {
-      Navigator.of(context).pop();
-    }
+    if (context.mounted) await _close(context);
+  }
+
+  Future<void> _snooze(BuildContext context) async {
+    await snoozePrayer(prayer);
+    if (context.mounted) await _close(context);
   }
 
   @override
@@ -619,80 +717,404 @@ class AlarmScreen extends StatelessWidget {
       backgroundColor: const Color(0xFF0F1F18),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
           child: Column(
             children: [
-              const SizedBox(height: 16),
-              const PrayerLogo(size: 96),
-              const SizedBox(height: 8),
-              Text(prayer.am,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                      fontSize: 44,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white)),
-              Text('${prayer.en} · ${prayer.clock24}',
-                  style: const TextStyle(fontSize: 16, color: Colors.white70)),
-              const SizedBox(height: 16),
+              // small logo with the prayer name beside it
+              Row(
+                children: [
+                  const PrayerLogo(size: 56),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(prayer.am,
+                            style: const TextStyle(
+                                fontSize: 34,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white)),
+                        Text('${prayer.en} · ${prayer.clock24}',
+                            style: const TextStyle(
+                                fontSize: 14, color: Colors.white70)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              // wide cards: verse, reason, and the user's own prayers
               Expanded(
                 child: SingleChildScrollView(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(prayer.verse,
-                          style: const TextStyle(
-                              fontSize: 20,
-                              fontStyle: FontStyle.italic,
-                              color: Colors.white)),
-                      const SizedBox(height: 16),
-                      Text(prayer.reason,
-                          style: const TextStyle(
-                              fontSize: 15, color: Colors.white70)),
-                      for (final t in prayer.texts) ...[
-                        const SizedBox(height: 16),
-                        if (t.title.isNotEmpty)
-                          Text(t.title,
-                              style: const TextStyle(
-                                  fontSize: 17,
-                                  fontWeight: FontWeight.bold,
-                                  color: Color(0xFFD8B96E))),
-                        Text(t.body,
-                            style: const TextStyle(
-                                fontSize: 17, color: Colors.white)),
-                      ],
+                      InfoCard(
+                          label: 'ጥቅስ · Verse',
+                          text: prayer.verse,
+                          quote: true,
+                          dark: true),
+                      InfoCard(
+                          label: 'ምክንያት · Reason',
+                          text: prayer.reason,
+                          dark: true),
+                      for (final t in prayer.texts)
+                        InfoCard(
+                            label: t.title.isNotEmpty
+                                ? t.title
+                                : 'ጸሎት / መዝሙር',
+                            text: t.body,
+                            dark: true),
                     ],
                   ),
                 ),
               ),
-              const SizedBox(height: 12),
-              SizedBox(
-                width: 88,
-                height: 88,
-                child: FilledButton(
-                  style: FilledButton.styleFrom(
-                    backgroundColor: Colors.red,
-                    shape: const CircleBorder(),
-                    padding: EdgeInsets.zero,
+              const SizedBox(height: 10),
+              // snooze with a small X beside it
+              Row(
+                children: [
+                  if (Platform.isAndroid) ...[
+                    Expanded(
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: const BorderSide(color: Color(0xFF4E6B5C)),
+                          minimumSize: const Size(0, 52),
+                          shape: const StadiumBorder(),
+                        ),
+                        onPressed: () => _snooze(context),
+                        child: const Text('Snooze 5 min'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                  ] else
+                    const Spacer(),
+                  IconButton.filled(
+                    tooltip: 'Dismiss',
+                    onPressed: () => _dismiss(context),
+                    style: IconButton.styleFrom(
+                      backgroundColor: const Color(0xFFC2392F),
+                      foregroundColor: Colors.white,
+                      fixedSize: const Size(56, 56),
+                    ),
+                    icon: const Icon(Icons.close, size: 28),
                   ),
-                  onPressed: () => _dismiss(context),
-                  child: const Icon(Icons.close, size: 48, color: Colors.white),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ======================= PRAYER DETAIL =======================
+
+class PrayerDetailScreen extends StatefulWidget {
+  final Prayer prayer;
+  const PrayerDetailScreen({super.key, required this.prayer});
+
+  @override
+  State<PrayerDetailScreen> createState() => _PrayerDetailScreenState();
+}
+
+class _PrayerDetailScreenState extends State<PrayerDetailScreen> {
+  Prayer get p => widget.prayer;
+
+  Future<void> _pickTime() async {
+    final t = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay(hour: p.hour, minute: p.minute),
+    );
+    if (t == null) return;
+    setState(() => p.minutes = t.hour * 60 + t.minute);
+    savePrayer(p);
+  }
+
+  Future<void> _editText({int? index}) async {
+    final existing = index == null ? null : p.texts[index];
+    final title = TextEditingController(text: existing?.title ?? '');
+    final body = TextEditingController(text: existing?.body ?? '');
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: Text(index == null ? 'ጸሎት / መዝሙር ጨምር' : 'አስተካክል · Edit'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: title,
+                decoration:
+                    const InputDecoration(labelText: 'ርዕስ (አማራጭ) · Title'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: body,
+                minLines: 4,
+                maxLines: 12,
+                decoration: const InputDecoration(
+                  labelText: 'ጽሑፍ · Text',
+                  alignLabelWithHint: true,
                 ),
               ),
-              const SizedBox(height: 6),
-              const Text('Dismiss', style: TextStyle(color: Colors.white70)),
-              if (Platform.isAndroid) ...[
-                const SizedBox(height: 14),
-                OutlinedButton(
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Color(0xFF4E6B5C)),
-                    minimumSize: const Size(160, 44),
-                    shape: const StadiumBorder(),
-                  ),
-                  onPressed: () => _snooze(context),
-                  child: const Text('Snooze 5 min'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('Save')),
+        ],
+      ),
+    );
+
+    if (ok != true || body.text.trim().isEmpty) return;
+    setState(() {
+      final t = UserText(title.text.trim(), body.text.trim());
+      if (index == null) {
+        p.texts.add(t);
+      } else {
+        p.texts[index] = t;
+      }
+    });
+    savePrayer(p);
+  }
+
+  void _useForAll() {
+    for (final o in prayers) {
+      o.soundUri = p.soundUri;
+      o.soundName = p.soundName;
+      savePrayer(o);
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Sound applied to all prayers')));
+  }
+
+  Future<void> _deleteText(int index) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Delete?'),
+        content: Text(p.texts[index].title.isNotEmpty
+            ? p.texts[index].title
+            : 'Delete this text?'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => p.texts.removeAt(index));
+    savePrayer(p);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: const Color(0xFFF7F5EE),
+        surfaceTintColor: Colors.transparent,
+        title: Row(
+          children: [
+            Text(p.am, style: const TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(width: 10),
+            Flexible(
+              child: Text(p.en,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 13)),
+            ),
+          ],
+        ),
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 720),
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              // time
+              Container(
+                padding: const EdgeInsets.all(16),
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: const Color(0xFFDDE3DA)),
+                  borderRadius: BorderRadius.circular(16),
                 ),
-              ],
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(p.clock24,
+                              style: const TextStyle(
+                                  fontSize: 32, fontWeight: FontWeight.w600)),
+                          Text('ሰዓት ${p.ethClock} · every day',
+                              style: const TextStyle(fontSize: 12)),
+                        ],
+                      ),
+                    ),
+                    OutlinedButton(
+                        onPressed: _pickTime,
+                        child: const Text('Change time')),
+                  ],
+                ),
+              ),
+              // mode
+              SizedBox(
+                width: double.infinity,
+                child: SegmentedButton<Mode>(
+                  segments: const [
+                    ButtonSegment(
+                        value: Mode.sound,
+                        icon: Icon(Icons.alarm),
+                        label: Text('Alarm')),
+                    ButtonSegment(
+                        value: Mode.silent,
+                        icon: Icon(Icons.notifications_none),
+                        label: Text('Silent')),
+                    ButtonSegment(
+                        value: Mode.off,
+                        icon: Icon(Icons.notifications_off),
+                        label: Text('Off')),
+                  ],
+                  selected: {p.mode},
+                  onSelectionChanged: (s) {
+                    setState(() => p.mode = s.first);
+                    savePrayer(p);
+                  },
+                ),
+              ),
+              const SizedBox(height: 10),
+              // ringtone for this prayer
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  border: Border.all(color: const Color(0xFFDDE3DA)),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('ድምፅ · Alarm sound',
+                        style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF1F4A38))),
+                    const SizedBox(height: 8),
+                    if (Platform.isAndroid)
+                      Row(
+                        children: [
+                          const Icon(Icons.music_note, size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(p.soundName)),
+                          OutlinedButton(
+                            onPressed: () async {
+                              await pickRingtone(p);
+                              if (!mounted) return;
+                              setState(() {});
+                              savePrayer(p);
+                            },
+                            child: const Text('Choose'),
+                          ),
+                        ],
+                      )
+                    else if (Platform.isWindows)
+                      DropdownButton<String>(
+                        isExpanded: true,
+                        value: p.winSound,
+                        items: [
+                          for (final v in WindowsNotificationSound.values)
+                            DropdownMenuItem(value: v.name, child: Text(v.name)),
+                        ],
+                        onChanged: (v) {
+                          if (v == null) return;
+                          setState(() => p.winSound = v);
+                          savePrayer(p);
+                        },
+                      ),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        TextButton.icon(
+                          icon: const Icon(Icons.play_arrow),
+                          label: const Text('Test'),
+                          onPressed: () => showNow(p),
+                        ),
+                        if (Platform.isAndroid)
+                          TextButton(
+                            onPressed: _useForAll,
+                            child: const Text('Use for all prayers'),
+                          ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              // verse + reason cards
+              InfoCard(label: 'ጥቅስ · Verse', text: p.verse, quote: true),
+              InfoCard(label: 'ምክንያት · Reason', text: p.reason),
+              // user's own prayers and psalms
+              Padding(
+                padding: const EdgeInsets.only(top: 8, bottom: 8),
+                child: Text('ጸሎቶች እና መዝሙራት (${p.texts.length})',
+                    style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF1F4A38))),
+              ),
+              if (p.texts.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.only(bottom: 8),
+                  child: Text(
+                      'Add the short prayers or psalms read at this hour.'),
+                ),
+              for (var i = 0; i < p.texts.length; i++)
+                InfoCard(
+                  label: p.texts[i].title.isNotEmpty
+                      ? p.texts[i].title
+                      : 'ጸሎት / መዝሙር',
+                  text: p.texts[i].body,
+                  footer: Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      IconButton(
+                        tooltip: 'Edit',
+                        icon: const Icon(Icons.edit, size: 20),
+                        onPressed: () => _editText(index: i),
+                      ),
+                      IconButton(
+                        tooltip: 'Delete',
+                        icon: const Icon(Icons.delete_outline, size: 20),
+                        onPressed: () => _deleteText(i),
+                      ),
+                    ],
+                  ),
+                ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FilledButton.tonalIcon(
+                  icon: const Icon(Icons.add),
+                  label: const Text('ጸሎት / መዝሙር ጨምር · Add'),
+                  onPressed: () => _editText(),
+                ),
+              ),
+              const SizedBox(height: 24),
             ],
           ),
         ),
@@ -769,10 +1191,21 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
     ]));
   }
 
+  Future<void> _showWindow() async {
+    await windowManager.setSkipTaskbar(false);
+    if (await windowManager.isMinimized()) await windowManager.restore();
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  Future<void> _exitApp() async {
+    await trayManager.destroy();
+    await windowManager.destroy();
+  }
+
   @override
   void onTrayIconMouseDown() {
-    windowManager.show();
-    windowManager.focus();
+    _showWindow();
   }
 
   @override
@@ -783,17 +1216,23 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
   @override
   void onTrayMenuItemClick(MenuItem menuItem) {
     if (menuItem.key == 'show') {
-      windowManager.show();
-      windowManager.focus();
+      _showWindow();
     } else if (menuItem.key == 'exit') {
-      windowManager.destroy();
+      _exitApp();
     }
   }
 
+  // Minimize button: hide to the tray (removed from the taskbar), keep running.
   @override
-  void onWindowClose() async {
-    final prevent = await windowManager.isPreventClose();
-    if (prevent) await windowManager.hide(); // X = minimize to tray
+  void onWindowMinimize() async {
+    await windowManager.setSkipTaskbar(true);
+    await windowManager.hide();
+  }
+
+  // X button: close the app completely.
+  @override
+  void onWindowClose() {
+    _exitApp();
   }
 
   // ---------- Windows notification check ----------
@@ -807,94 +1246,6 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
         showNow(p);
       }
     }
-  }
-
-  // ---------- Actions ----------
-  Future<void> _pickTime(Prayer p) async {
-    final t = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay(hour: p.hour, minute: p.minute),
-    );
-    if (t == null) return;
-    setState(() => p.minutes = t.hour * 60 + t.minute);
-    savePrayer(p);
-  }
-
-  Future<void> _editText(Prayer p, {int? index}) async {
-    final existing = index == null ? null : p.texts[index];
-    final title = TextEditingController(text: existing?.title ?? '');
-    final body = TextEditingController(text: existing?.body ?? '');
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (c) => AlertDialog(
-        title: Text(index == null ? 'ጸሎት / መዝሙር ጨምር' : 'አስተካክል · Edit'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: title,
-                decoration:
-                    const InputDecoration(labelText: 'ርዕስ (አማራጭ) · Title'),
-              ),
-              const SizedBox(height: 8),
-              TextField(
-                controller: body,
-                minLines: 4,
-                maxLines: 12,
-                decoration: const InputDecoration(
-                  labelText: 'ጽሑፍ · Text',
-                  alignLabelWithHint: true,
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('Save')),
-        ],
-      ),
-    );
-
-    if (ok != true || body.text.trim().isEmpty) return;
-    setState(() {
-      final t = UserText(title.text.trim(), body.text.trim());
-      if (index == null) {
-        p.texts.add(t);
-      } else {
-        p.texts[index] = t;
-      }
-    });
-    savePrayer(p);
-  }
-
-  Future<void> _deleteText(Prayer p, int index) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (c) => AlertDialog(
-        title: const Text('Delete?'),
-        content: Text(p.texts[index].title.isNotEmpty
-            ? p.texts[index].title
-            : 'Delete this text?'),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('Cancel')),
-          FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('Delete')),
-        ],
-      ),
-    );
-    if (ok != true) return;
-    setState(() => p.texts.removeAt(index));
-    savePrayer(p);
   }
 
   // ---------- UI ----------
@@ -966,8 +1317,29 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
   }
 
   Widget _prayerCard(Prayer p, bool isNext, ColorScheme scheme) {
+    Color chipBg;
+    Color chipFg;
+    String chipLabel;
+    switch (p.mode) {
+      case Mode.sound:
+        chipBg = const Color(0xFFDDE8DF);
+        chipFg = const Color(0xFF1F4A38);
+        chipLabel = 'Alarm';
+        break;
+      case Mode.silent:
+        chipBg = const Color(0xFFF1E6C9);
+        chipFg = const Color(0xFF5C4A18);
+        chipLabel = 'Silent';
+        break;
+      case Mode.off:
+        chipBg = const Color(0xFFE6E8E3);
+        chipFg = const Color(0xFF4B5A50);
+        chipLabel = 'Off';
+        break;
+    }
     return Card(
       elevation: 0,
+      clipBehavior: Clip.antiAlias,
       color: isNext ? Colors.white : const Color(0xFFFBFAF5),
       shape: isNext
           ? RoundedRectangleBorder(
@@ -975,128 +1347,58 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
               side: BorderSide(color: scheme.primary, width: 2),
             )
           : null,
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(p.am,
-                          style: Theme.of(context).textTheme.titleLarge),
-                      Text(p.en),
-                    ],
-                  ),
+      child: InkWell(
+        onTap: () async {
+          await Navigator.of(context).push(MaterialPageRoute(
+            builder: (_) => PrayerDetailScreen(prayer: p),
+          ));
+          if (mounted) setState(() {});
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(p.am, style: Theme.of(context).textTheme.titleLarge),
+                    Text(p.en, style: const TextStyle(fontSize: 12)),
+                  ],
                 ),
-                if (isNext)
-                  const Padding(
-                    padding: EdgeInsets.only(right: 4),
-                    child: Icon(Icons.notifications_active),
-                  ),
-                TextButton(
-                  onPressed: () => _pickTime(p),
-                  child: Column(
-                    children: [
-                      Text(p.clock24, style: const TextStyle(fontSize: 20)),
-                      Text('ሰዓት ${p.ethClock}',
-                          style: const TextStyle(fontSize: 12)),
-                    ],
-                  ),
+              ),
+              if (isNext)
+                const Padding(
+                  padding: EdgeInsets.only(right: 8),
+                  child: Icon(Icons.notifications_active, size: 20),
                 ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            SegmentedButton<Mode>(
-              segments: const [
-                ButtonSegment(
-                    value: Mode.sound,
-                    icon: Icon(Icons.alarm),
-                    label: Text('Alarm')),
-                ButtonSegment(
-                    value: Mode.silent,
-                    icon: Icon(Icons.notifications_none),
-                    label: Text('Silent')),
-                ButtonSegment(
-                    value: Mode.off,
-                    icon: Icon(Icons.notifications_off),
-                    label: Text('Off')),
-              ],
-              selected: {p.mode},
-              onSelectionChanged: (s) {
-                setState(() => p.mode = s.first);
-                savePrayer(p);
-              },
-            ),
-            ExpansionTile(
-              tilePadding: EdgeInsets.zero,
-              childrenPadding: const EdgeInsets.only(bottom: 8),
-              shape: const Border(),
-              collapsedShape: const Border(),
-              expandedCrossAxisAlignment: CrossAxisAlignment.start,
-              title: const Text('ምክንያት እና ጥቅስ'),
-              children: [
-                Text(p.reason),
-                const SizedBox(height: 8),
-                Text(p.verse,
-                    style: const TextStyle(fontStyle: FontStyle.italic)),
-              ],
-            ),
-            ExpansionTile(
-              tilePadding: EdgeInsets.zero,
-              childrenPadding: const EdgeInsets.only(bottom: 8),
-              shape: const Border(),
-              collapsedShape: const Border(),
-              expandedCrossAxisAlignment: CrossAxisAlignment.start,
-              title: Text('ጸሎቶች እና መዝሙራት (${p.texts.length})'),
-              children: [
-                for (var i = 0; i < p.texts.length; i++)
-                  Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: scheme.outlineVariant),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (p.texts[i].title.isNotEmpty)
-                          Text(p.texts[i].title,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.bold)),
-                        SelectableText(p.texts[i].body),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.end,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.edit, size: 20),
-                              onPressed: () => _editText(p, index: i),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.delete_outline, size: 20),
-                              onPressed: () => _deleteText(p, i),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: TextButton.icon(
-                    icon: const Icon(Icons.add),
-                    label: const Text('ጸሎት / መዝሙር ጨምር · Add'),
-                    onPressed: () => _editText(p),
-                  ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(p.clock24,
+                      style: const TextStyle(
+                          fontSize: 17, fontWeight: FontWeight.w600)),
+                  Text('ሰዓት ${p.ethClock}',
+                      style: const TextStyle(fontSize: 11)),
+                ],
+              ),
+              const SizedBox(width: 10),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: chipBg,
+                  borderRadius: BorderRadius.circular(99),
                 ),
-              ],
-            ),
-          ],
+                child: Text(chipLabel,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: chipFg)),
+              ),
+              const Icon(Icons.chevron_right, size: 20),
+            ],
+          ),
         ),
       ),
     );
@@ -1139,7 +1441,7 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
             const Padding(
               padding: EdgeInsets.all(12),
               child: Text(
-                'Windows: closing the window keeps the app running in the system tray.',
+                'Windows: Minimize hides the app to the system tray and keeps notifying you. Close (X) exits the app completely.',
                 textAlign: TextAlign.center,
               ),
             ),
