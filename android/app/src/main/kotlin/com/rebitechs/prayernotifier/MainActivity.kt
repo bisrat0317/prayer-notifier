@@ -1,4 +1,4 @@
-package com.example.prayer_notifier
+package com.rebitechs.prayernotifier
 
 import android.app.Activity
 import android.content.Intent

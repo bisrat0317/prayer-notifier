@@ -13,6 +13,8 @@ import 'package:timezone/timezone.dart' as tz;
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'brand.dart';
+
 // ======================= MODELS =======================
 
 enum Mode { sound, silent, off }
@@ -199,7 +201,12 @@ DateTime? prevPrayerTime() {
 String bodyFor(Prayer p) => p.verse;
 
 @pragma('vm:entry-point')
-void notificationTapBackground(NotificationResponse response) {}
+void notificationTapBackground(NotificationResponse response) {
+  final id = response.id;
+  if (id != null && response.actionId == 'dismiss') {
+    FlutterLocalNotificationsPlugin().cancel(id: id);
+  }
+}
 
 void onNotificationResponse(NotificationResponse r) {
   final id = r.id;
@@ -291,7 +298,7 @@ Future<void> initNotifications() async {
   const android = AndroidInitializationSettings('@mipmap/ic_launcher');
   const windows = WindowsInitializationSettings(
     appName: 'Prayer Notifier',
-    appUserModelId: 'com.example.prayer_notifier',
+    appUserModelId: 'com.rebitechs.prayernotifier',
     guid: 'a3f1c2d4-5b6e-4f70-8a91-b2c3d4e5f607',
   );
   await plugin.initialize(
@@ -600,6 +607,26 @@ class _SplashScreenState extends State<SplashScreen>
         .animate(CurvedAnimation(parent: _c, curve: Curves.easeOutBack));
     return Scaffold(
       backgroundColor: const Color(0xFFF7F5EE),
+      bottomNavigationBar: FadeTransition(
+        opacity: fade,
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: const [
+                Text('from',
+                    style: TextStyle(
+                        fontSize: 11,
+                        letterSpacing: 2,
+                        color: Color(0xFF5B6B60))),
+                SizedBox(height: 6),
+                RebiLogo(height: 32),
+              ],
+            ),
+          ),
+        ),
+      ),
       body: Center(
         child: FadeTransition(
           opacity: fade,
@@ -1123,6 +1150,81 @@ class _PrayerDetailScreenState extends State<PrayerDetailScreen> {
   }
 }
 
+// ======================= ABOUT =======================
+
+const kAppVersion = '1.0.0';
+
+class AboutScreen extends StatelessWidget {
+  const AboutScreen({super.key});
+
+  Widget _contact(BuildContext context, IconData icon, String label, String value) {
+    return ListTile(
+      leading: Icon(icon),
+      title: Text(label),
+      subtitle: Text(value),
+      trailing: const Icon(Icons.copy, size: 18),
+      onTap: () {
+        Clipboard.setData(ClipboardData(text: value));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('$label copied')));
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const muted = Color(0xFF5B6B60);
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: const Color(0xFFF7F5EE),
+        surfaceTintColor: Colors.transparent,
+        title: const Text('About'),
+      ),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 560),
+          child: ListView(
+            padding: const EdgeInsets.all(24),
+            children: [
+              const Center(child: PrayerLogo(size: 96)),
+              const SizedBox(height: 14),
+              const Text('ሰባቱ ጊዜ ጸሎት',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              const Text('Prayer Notifier · version $kAppVersion',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: muted)),
+              const SizedBox(height: 28),
+              const Divider(),
+              const SizedBox(height: 20),
+              const Text('Made by',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, letterSpacing: 2, color: muted)),
+              const SizedBox(height: 10),
+              const Center(child: RebiLogo(height: 64)),
+              const SizedBox(height: 12),
+              const Text(kBrandTagline,
+                  textAlign: TextAlign.center, style: TextStyle(color: muted)),
+              const SizedBox(height: 16),
+              if (kBrandWebsite.isNotEmpty)
+                _contact(context, Icons.language, 'Website', kBrandWebsite),
+              if (kBrandTelegram.isNotEmpty)
+                _contact(context, Icons.send, 'Telegram', kBrandTelegram),
+              if (kBrandEmail.isNotEmpty)
+                _contact(context, Icons.email_outlined, 'Email', kBrandEmail),
+              const SizedBox(height: 20),
+              const Text('© 2026 $kBrandName. All rights reserved.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 12, color: muted)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ======================= HOME SCREEN =======================
 
 class Home extends StatefulWidget {
@@ -1413,6 +1515,14 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
         backgroundColor: const Color(0xFFF7F5EE),
         surfaceTintColor: Colors.transparent,
         titleSpacing: 16,
+        actions: [
+          IconButton(
+            tooltip: 'About',
+            icon: const Icon(Icons.info_outline),
+            onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const AboutScreen())),
+          ),
+        ],
         title: Row(
           children: const [
             PrayerLogo(size: 32),

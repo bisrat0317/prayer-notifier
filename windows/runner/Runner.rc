@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "prayer_notifier" "\0"
+            VALUE "CompanyName", "Rebi Techs" "\0"
+            VALUE "FileDescription", "Prayer Notifier" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "prayer_notifier" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Rebi Techs. All rights reserved." "\0"
             VALUE "OriginalFilename", "prayer_notifier.exe" "\0"
-            VALUE "ProductName", "prayer_notifier" "\0"
+            VALUE "ProductName", "Prayer Notifier" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END
