@@ -130,6 +130,86 @@ final plugin = FlutterLocalNotificationsPlugin();
 final navigatorKey = GlobalKey<NavigatorState>();
 final List<Prayer> prayers = defaultPrayers();
 
+// ---- Round 1: pre-alarm, mute, "prayed" check-in ----
+int preAlarmMinutes = 0; // 0 = off, otherwise 5 / 10 / 15
+DateTime? muteUntil; // null = not muted
+final Set<int> doneToday = {}; // prayers marked as prayed (current Ethiopian day)
+String _doneDay = '';
+
+bool get isMuted => muteUntil != null && muteUntil!.isAfter(DateTime.now());
+
+// The Ethiopian day starts at 6:00, so the midnight prayer belongs to the
+// day that is ending, not the one that is starting.
+String dayKeyFor(DateTime t) {
+  final d = t.subtract(const Duration(hours: 6));
+  return '${d.year}${d.month.toString().padLeft(2, '0')}${d.day.toString().padLeft(2, '0')}';
+}
+
+// The most recent time this prayer's alarm rang (today or yesterday).
+DateTime lastOccurrence(Prayer p) {
+  final now = DateTime.now();
+  var at = DateTime(now.year, now.month, now.day, p.hour, p.minute);
+  if (at.isAfter(now)) at = at.subtract(const Duration(days: 1));
+  return at;
+}
+
+Future<void> loadDone() async {
+  _doneDay = dayKeyFor(DateTime.now()); // set first so timers don't re-trigger
+  final sp = await SharedPreferences.getInstance();
+  doneToday
+    ..clear()
+    ..addAll((sp.getStringList('done_$_doneDay') ?? <String>[])
+        .map(int.parse));
+  // keep only today's and yesterday's records - nothing is kept as history
+  final yesterday = dayKeyFor(DateTime.now().subtract(const Duration(days: 1)));
+  for (final k in sp.getKeys().toList()) {
+    if (k.startsWith('done_') && k != 'done_$_doneDay' && k != 'done_$yesterday') {
+      await sp.remove(k);
+    }
+  }
+}
+
+Future<void> setPrayed(Prayer p, bool value, {DateTime? occurrence}) async {
+  final sp = await SharedPreferences.getInstance();
+  final key = dayKeyFor(occurrence ?? DateTime.now());
+  final list = (sp.getStringList('done_$key') ?? <String>[]).toSet();
+  if (value) {
+    list.add('${p.id}');
+  } else {
+    list.remove('${p.id}');
+  }
+  await sp.setStringList('done_$key', list.toList());
+  if (key == _doneDay) {
+    if (value) {
+      doneToday.add(p.id);
+    } else {
+      doneToday.remove(p.id);
+    }
+  }
+}
+
+Future<void> saveSettings() async {
+  final sp = await SharedPreferences.getInstance();
+  await sp.setInt('pre', preAlarmMinutes);
+  if (muteUntil == null) {
+    await sp.remove('mute');
+  } else {
+    await sp.setInt('mute', muteUntil!.millisecondsSinceEpoch);
+  }
+}
+
+Future<void> setPreAlarm(int minutes) async {
+  preAlarmMinutes = minutes;
+  await saveSettings();
+  await rescheduleAll();
+}
+
+Future<void> setMuteUntil(DateTime? until) async {
+  muteUntil = until;
+  await saveSettings();
+  await rescheduleAll();
+}
+
 Future<void> loadPrayers() async {
   final sp = await SharedPreferences.getInstance();
   for (final p in prayers) {
@@ -149,6 +229,14 @@ Future<void> loadPrayers() async {
       } catch (_) {}
     }
   }
+  preAlarmMinutes = sp.getInt('pre') ?? 0;
+  final mu = sp.getInt('mute');
+  muteUntil = mu == null ? null : DateTime.fromMillisecondsSinceEpoch(mu);
+  if (muteUntil != null && !muteUntil!.isAfter(DateTime.now())) {
+    muteUntil = null;
+    await sp.remove('mute');
+  }
+  await loadDone();
 }
 
 Future<void> savePrayer(Prayer p) async {
@@ -164,7 +252,7 @@ Future<void> savePrayer(Prayer p) async {
   await sp.setString('w${p.id}', p.winSound);
   await sp.setString(
       'x${p.id}', jsonEncode(p.texts.map((t) => t.toJson()).toList()));
-  if (Platform.isAndroid) await scheduleAndroid(p);
+  if (Platform.isAndroid) await scheduleAndroid(p, clearSnooze: true);
 }
 
 NextPrayer? findNext() {
@@ -200,22 +288,27 @@ DateTime? prevPrayerTime() {
 
 String bodyFor(Prayer p) => p.verse;
 
+// The Dismiss button removes its own notification natively (cancelNotification
+// is true). We must NOT call plugin.cancel() here: that would also cancel
+// tomorrow's repeating alarm.
 @pragma('vm:entry-point')
-void notificationTapBackground(NotificationResponse response) {
-  final id = response.id;
-  if (id != null && response.actionId == 'dismiss') {
-    FlutterLocalNotificationsPlugin().cancel(id: id);
-  }
+void notificationTapBackground(NotificationResponse response) {}
+
+// Ids: 1-7 prayer alarm | 101-107 snooze | 1100-1713 one-time alarms (mute window).
+// Anything else (the pre-alarms) just opens the app.
+int? alarmPrayerId(int id) {
+  if (id >= 1 && id <= 7) return id;
+  if (id >= 101 && id <= 107) return id - 100;
+  if (id >= 1000 && id < 2000) return (id - 1000) ~/ 100;
+  return null;
 }
 
 void onNotificationResponse(NotificationResponse r) {
   final id = r.id;
   if (id == null) return;
-  if (r.actionId == 'dismiss') {
-    plugin.cancel(id: id);
-    return;
-  }
-  final pid = id > 100 ? id - 100 : id;
+  if (r.actionId == 'dismiss') return;
+  final pid = alarmPrayerId(id);
+  if (pid == null) return;
   final match = prayers.where((e) => e.id == pid);
   if (match.isEmpty) return;
   navigatorKey.currentState?.push(MaterialPageRoute(
@@ -247,8 +340,8 @@ Future<void> pickRingtone(Prayer p) async {
   }
 }
 
-NotificationDetails detailsFor(Prayer p) {
-  final sound = p.mode == Mode.sound;
+NotificationDetails detailsFor(Prayer p, {bool muted = false}) {
+  final sound = p.mode == Mode.sound && !muted;
   final uri = p.soundUri ?? kDefaultAlarmUri;
   return NotificationDetails(
     android: AndroidNotificationDetails(
@@ -256,17 +349,25 @@ NotificationDetails detailsFor(Prayer p) {
       // dismiss button). Silent only turns the sound and vibration off.
       // Channel settings can't change once created, so Silent has its own channel.
       // one channel per ringtone (Android fixes a channel's sound once created)
-      sound ? 'prayer_alarm_${_stableHash(uri)}' : 'prayer_silent_v3',
-      sound ? 'Prayer alarm · ${p.soundName}' : 'Prayer alarm (silent)',
+      muted
+          ? 'prayer_muted_v1'
+          : (sound ? 'prayer_alarm_${_stableHash(uri)}' : 'prayer_silent_v3'),
+      muted
+          ? 'Prayer (muted banner)'
+          : (sound ? 'Prayer alarm · ${p.soundName}' : 'Prayer alarm (silent)'),
       channelDescription: 'Notifications for the seven daily prayer hours',
-      importance: Importance.max,
-      priority: Priority.max,
+      importance: muted ? Importance.high : Importance.max,
+      priority: muted ? Priority.high : Priority.max,
       playSound: sound,
       sound: sound ? UriAndroidNotificationSound(uri) : null,
       enableVibration: sound,
-      category: AndroidNotificationCategory.alarm,
-      fullScreenIntent: true,
-      audioAttributesUsage: AudioAttributesUsage.alarm,
+      category: muted
+          ? AndroidNotificationCategory.reminder
+          : AndroidNotificationCategory.alarm,
+      fullScreenIntent: !muted, // a muted banner never wakes the screen
+      audioAttributesUsage: muted
+          ? AudioAttributesUsage.notification
+          : AudioAttributesUsage.alarm,
       additionalFlags: sound ? Int32List.fromList(<int>[4]) : null, // repeat sound
       timeoutAfter: 120000,
       visibility: NotificationVisibility.public,
@@ -316,48 +417,239 @@ Future<void> initNotifications() async {
   }
 }
 
-// Android: OS-level daily scheduled notification
-Future<void> scheduleAndroid(Prayer p) async {
-  await plugin.cancel(id: p.id);
-  if (p.mode == Mode.off) return;
+// ======================= SCHEDULING (Android) =======================
+// Notification ids:
+//   1-7        repeating daily prayer alarm       101-107    snooze (one-time)
+//   201-207    repeating daily pre-alarm
+//   1100-1713  one-time prayer alarms used while a mute window is active
+//   2100-2713  one-time pre-alarms used while a mute window is active
 
+const kRollingDays = 14;
+int _rollBase(Prayer p) => 1000 + p.id * 100;
+int _preRollBase(Prayer p) => 2000 + p.id * 100;
+
+Future<AndroidScheduleMode> _scheduleMode() async {
+  final a = plugin.resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  final canExact = await a?.canScheduleExactNotifications() ?? false;
+  // If "Alarms & reminders" was denied, fall back to an inexact alarm
+  // (can be a few minutes late) instead of failing silently.
+  return canExact
+      ? AndroidScheduleMode.exactAllowWhileIdle
+      : AndroidScheduleMode.inexactAllowWhileIdle;
+}
+
+// Ids of notifications that are on screen right now.
+Future<Set<int>> _activeIds() async {
+  try {
+    final a = plugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    final list = await a?.getActiveNotifications() ?? <ActiveNotification>[];
+    return {
+      for (final n in list)
+        if (n.id != null) n.id!,
+    };
+  } catch (_) {
+    return <int>{};
+  }
+}
+
+NotificationDetails preDetailsFor(Prayer p) {
+  final chime = p.mode == Mode.sound; // Alarm -> soft chime, Silent -> no sound
+  return NotificationDetails(
+    android: AndroidNotificationDetails(
+      chime ? 'prayer_pre_chime_v1' : 'prayer_pre_silent_v1',
+      chime ? 'Prayer reminder (soft chime)' : 'Prayer reminder (silent)',
+      channelDescription: 'A gentle reminder shortly before a prayer time',
+      importance: Importance.high,
+      priority: Priority.high,
+      playSound: chime,
+      enableVibration: false,
+      category: AndroidNotificationCategory.reminder,
+      timeoutAfter: preAlarmMinutes * 60 * 1000, // goes away at prayer time
+      visibility: NotificationVisibility.public,
+    ),
+    windows: WindowsNotificationDetails(audio: WindowsNotificationAudio.silent()),
+  );
+}
+
+String _preBody(Prayer p) =>
+    'Prayer time in $preAlarmMinutes minutes · ${p.en} (${p.clock24})';
+
+Future<void> _clearItem(int id, int rollBase, Set<int> active) async {
+  await plugin.cancel(id: id);
+  for (var k = 0; k < kRollingDays; k++) {
+    if (!active.contains(rollBase + k)) await plugin.cancel(id: rollBase + k);
+  }
+}
+
+// Schedules one daily item (a prayer alarm or its pre-alarm).
+Future<void> _scheduleItem({
+  required int id,
+  required int rollBase,
+  required int hour,
+  required int minute,
+  required String title,
+  required String body,
+  required NotificationDetails normal,
+  NotificationDetails? muted, // null = skip the ones inside a mute window
+  required AndroidScheduleMode mode,
+  required Set<int> active,
+}) async {
   final now = tz.TZDateTime.now(tz.local);
-  var when = tz.TZDateTime(
-      tz.local, now.year, now.month, now.day, p.hour, p.minute);
-  if (when.isBefore(now)) when = when.add(const Duration(days: 1));
+  var first =
+      tz.TZDateTime(tz.local, now.year, now.month, now.day, hour, minute);
+  if (!first.isAfter(now)) first = first.add(const Duration(days: 1));
 
-  await plugin.zonedSchedule(
+  final until = isMuted ? muteUntil : null;
+  final affected = until != null && first.isBefore(until);
+
+  try {
+    if (!affected) {
+      // Normal case: ONE repeating daily alarm. Scheduling again with the same
+      // id replaces it and leaves a notification that is on screen alone.
+      for (var k = 0; k < kRollingDays; k++) {
+        if (!active.contains(rollBase + k)) {
+          await plugin.cancel(id: rollBase + k);
+        }
+      }
+      await plugin.zonedSchedule(
+        id: id,
+        title: title,
+        body: body,
+        scheduledDate: first,
+        notificationDetails: normal,
+        androidScheduleMode: mode,
+        matchDateTimeComponents: DateTimeComponents.time, // repeat daily
+      );
+    } else {
+      // Android cannot delay a repeating alarm, so while a mute window is
+      // active we use one-time alarms for the next days. The normal repeating
+      // alarm is put back the next time the app opens (or the mute ends).
+      final u = until!;
+      await plugin.cancel(id: id);
+      for (var k = 0; k < kRollingDays; k++) {
+        final at = first.add(Duration(days: k));
+        final details = at.isBefore(u) ? muted : normal;
+        if (details == null) continue;
+        await plugin.zonedSchedule(
+          id: rollBase + k,
+          title: title,
+          body: body,
+          scheduledDate: at,
+          notificationDetails: details,
+          androidScheduleMode: mode,
+        );
+      }
+    }
+  } catch (e) {
+    debugPrint('Could not schedule $title: $e');
+  }
+}
+
+Future<void> scheduleAndroid(Prayer p,
+    {bool clearSnooze = false, Set<int>? active}) async {
+  if (clearSnooze) await plugin.cancel(id: p.id + 100); // pending snooze
+  final act = active ?? await _activeIds();
+
+  if (p.mode == Mode.off) {
+    await _clearItem(p.id, _rollBase(p), act);
+    await _clearItem(p.id + 200, _preRollBase(p), act);
+    return;
+  }
+
+  final mode = await _scheduleMode();
+  await _scheduleItem(
     id: p.id,
+    rollBase: _rollBase(p),
+    hour: p.hour,
+    minute: p.minute,
     title: p.am,
     body: bodyFor(p),
-    scheduledDate: when,
-    notificationDetails: detailsFor(p),
-    androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-    matchDateTimeComponents: DateTimeComponents.time, // repeat daily
+    normal: detailsFor(p),
+    muted: detailsFor(p, muted: true),
+    mode: mode,
+    active: act,
   );
+
+  if (preAlarmMinutes > 0) {
+    final m = (p.minutes - preAlarmMinutes) % 1440; // 00:00 prayer -> 23:5x
+    await _scheduleItem(
+      id: p.id + 200,
+      rollBase: _preRollBase(p),
+      hour: m ~/ 60,
+      minute: m % 60,
+      title: p.am,
+      body: _preBody(p),
+      normal: preDetailsFor(p),
+      muted: null,
+      mode: mode,
+      active: act,
+    );
+  } else {
+    await _clearItem(p.id + 200, _preRollBase(p), act);
+  }
+}
+
+Future<void> rescheduleAll() async {
+  if (!Platform.isAndroid) return;
+  final active = await _activeIds();
+  for (final p in prayers) {
+    await scheduleAndroid(p, active: active);
+  }
+}
+
+// Removes the notification that is ringing/showing for this prayer, but keeps
+// tomorrow's alarm (cancelling a repeating id also cancels its next alarm).
+Future<void> dismissShown(Prayer p) async {
+  if (!Platform.isAndroid) return;
+  final active = await _activeIds();
+  var hitRepeating = false;
+  for (final id in active) {
+    if (alarmPrayerId(id) != p.id) continue;
+    await plugin.cancel(id: id);
+    if (id == p.id) hitRepeating = true;
+  }
+  if (hitRepeating) await scheduleAndroid(p); // put tomorrow's alarm back
 }
 
 // Snooze: one-time repeat of the alarm in 5 minutes (Android only).
 Future<void> snoozePrayer(Prayer p) async {
-  await plugin.cancel(id: p.id);
   if (!Platform.isAndroid) return;
+  await dismissShown(p);
+  await plugin.cancel(id: p.id + 100);
   final when = tz.TZDateTime.now(tz.local).add(const Duration(minutes: 5));
-  await plugin.zonedSchedule(
-    id: p.id + 100,
-    title: p.am,
-    body: bodyFor(p),
-    scheduledDate: when,
-    notificationDetails: detailsFor(p),
-    androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-  );
+  final u = isMuted ? muteUntil : null;
+  final muted = u != null && when.isBefore(u);
+  try {
+    await plugin.zonedSchedule(
+      id: p.id + 100,
+      title: p.am,
+      body: bodyFor(p),
+      scheduledDate: when,
+      notificationDetails: detailsFor(p, muted: muted),
+      androidScheduleMode: await _scheduleMode(),
+    );
+  } catch (e) {
+    debugPrint('Could not schedule snooze: $e');
+  }
 }
 
-Future<void> showNow(Prayer p) async {
+Future<void> showNow(Prayer p, {bool muted = false}) async {
   await plugin.show(
     id: p.id,
     title: p.am,
     body: bodyFor(p),
-    notificationDetails: detailsFor(p),
+    notificationDetails: detailsFor(p, muted: muted),
+  );
+}
+
+Future<void> showPre(Prayer p) async {
+  await plugin.show(
+    id: p.id + 200,
+    title: p.am,
+    body: _preBody(p),
+    notificationDetails: preDetailsFor(p),
   );
 }
 
@@ -374,7 +666,7 @@ void main() async {
     final d = await plugin.getNotificationAppLaunchDetails();
     if (d?.didNotificationLaunchApp ?? false) {
       final nid = d?.notificationResponse?.id;
-      launchPrayerId = (nid != null && nid > 100) ? nid - 100 : nid;
+      launchPrayerId = nid == null ? null : alarmPrayerId(nid);
     }
   }
 
@@ -729,12 +1021,19 @@ class AlarmScreen extends StatelessWidget {
   }
 
   Future<void> _dismiss(BuildContext context) async {
-    await plugin.cancel(id: prayer.id);
+    await dismissShown(prayer);
     if (context.mounted) await _close(context);
   }
 
   Future<void> _snooze(BuildContext context) async {
     await snoozePrayer(prayer);
+    if (context.mounted) await _close(context);
+  }
+
+  // "Prayed" - quietly remembers it for today, then closes the alarm.
+  Future<void> _prayed(BuildContext context) async {
+    await setPrayed(prayer, true, occurrence: lastOccurrence(prayer));
+    await dismissShown(prayer);
     if (context.mounted) await _close(context);
   }
 
@@ -797,7 +1096,7 @@ class AlarmScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 10),
-              // snooze with a small X beside it
+              // snooze, prayed, and a small X
               Row(
                 children: [
                   if (Platform.isAndroid) ...[
@@ -807,15 +1106,30 @@ class AlarmScreen extends StatelessWidget {
                           foregroundColor: Colors.white,
                           side: const BorderSide(color: Color(0xFF4E6B5C)),
                           minimumSize: const Size(0, 52),
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
                           shape: const StadiumBorder(),
                         ),
                         onPressed: () => _snooze(context),
                         child: const Text('Snooze 5 min'),
                       ),
                     ),
-                    const SizedBox(width: 12),
-                  ] else
-                    const Spacer(),
+                    const SizedBox(width: 10),
+                  ],
+                  Expanded(
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFFC8AA6A),
+                        foregroundColor: const Color(0xFF14281F),
+                        minimumSize: const Size(0, 52),
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        shape: const StadiumBorder(),
+                      ),
+                      onPressed: () => _prayed(context),
+                      child: const Text('Prayed ✓',
+                          style: TextStyle(fontWeight: FontWeight.w600)),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
                   IconButton.filled(
                     tooltip: 'Dismiss',
                     onPressed: () => _dismiss(context),
@@ -1242,11 +1556,7 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
   void initState() {
     super.initState();
 
-    if (Platform.isAndroid) {
-      for (final p in prayers) {
-        scheduleAndroid(p);
-      }
-    }
+    rescheduleAll(); // Android: (re)register every alarm and pre-alarm
     if (Platform.isWindows) {
       windowManager.addListener(this);
       trayManager.addListener(this);
@@ -1256,6 +1566,14 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
     // One timer: live countdown on every platform + Windows notifications.
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (Platform.isWindows) _tick();
+      // a new Ethiopian day (06:00) clears the "prayed" dots
+      if (dayKeyFor(DateTime.now()) != _doneDay) loadDone();
+      // a finished mute window: go back to the normal repeating alarms
+      if (muteUntil != null && !isMuted) {
+        muteUntil = null;
+        saveSettings();
+        rescheduleAll();
+      }
       if (mounted) setState(() {});
     });
 
@@ -1341,11 +1659,18 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
   void _tick() {
     final n = DateTime.now();
     final day = '${n.year}-${n.month}-${n.day}';
+    final nowMin = n.hour * 60 + n.minute;
     for (final p in prayers) {
       if (p.mode == Mode.off) continue;
+      if (preAlarmMinutes > 0 && !isMuted) {
+        final pm = (p.minutes - preAlarmMinutes) % 1440;
+        if (nowMin == pm && _firedToday.add('pre-${p.id}-$day-$pm')) {
+          showPre(p);
+        }
+      }
       final key = '${p.id}-$day-${p.minutes}';
       if (n.hour == p.hour && n.minute == p.minute && _firedToday.add(key)) {
-        showNow(p);
+        showNow(p, muted: isMuted);
       }
     }
   }
@@ -1416,6 +1741,192 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
         ),
       ),
     );
+  }
+
+  String _hhmm(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+
+  // Seven quiet dots for today. No streaks, no counts, nothing for past days.
+  Widget _dots() {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Text('ዛሬ',
+              style: TextStyle(fontSize: 12, color: Color(0xFF5B6B60))),
+          const SizedBox(width: 6),
+          for (final p in prayers)
+            Semantics(
+              button: true,
+              label:
+                  '${p.en}: ${doneToday.contains(p.id) ? 'prayed' : 'not marked'}',
+              child: InkResponse(
+                radius: 22,
+                onTap: () async {
+                  await setPrayed(p, !doneToday.contains(p.id));
+                  if (mounted) setState(() {});
+                },
+                child: Padding(
+                  padding: const EdgeInsets.all(11),
+                  child: Container(
+                    width: 14,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: doneToday.contains(p.id)
+                          ? const Color(0xFFC8AA6A)
+                          : Colors.transparent,
+                      border: Border.all(
+                        color: doneToday.contains(p.id)
+                            ? const Color(0xFFC8AA6A)
+                            : const Color(0xFF9AA79F),
+                        width: 1.5,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _controls() {
+    final muted = isMuted;
+    return Column(
+      children: [
+        if (muted)
+          Container(
+            margin: const EdgeInsets.only(top: 2, bottom: 4),
+            padding: const EdgeInsets.fromLTRB(14, 4, 6, 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF1E6C9),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.volume_off,
+                    size: 20, color: Color(0xFF5C4A18)),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Silent until ${_hhmm(muteUntil!)} · quiet banners only',
+                    style: const TextStyle(color: Color(0xFF5C4A18)),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () async {
+                    await setMuteUntil(null);
+                    if (mounted) setState(() {});
+                  },
+                  child: const Text('Cancel'),
+                ),
+              ],
+            ),
+          ),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: [
+            ActionChip(
+              avatar: const Icon(Icons.volume_off, size: 18),
+              label: Text(muted ? 'Change mute' : 'Mute…'),
+              onPressed: _muteSheet,
+            ),
+            ActionChip(
+              avatar: const Icon(Icons.timer_outlined, size: 18),
+              label: Text(preAlarmMinutes == 0
+                  ? 'Pre-alert: off'
+                  : 'Pre-alert: $preAlarmMinutes min'),
+              onPressed: _preSheet,
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Future<void> _muteSheet() async {
+    final choice = await showModalBottomSheet<int>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              title: Text('Silence prayers',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(
+                  'Prayers still appear as quiet banners: no sound, no vibration, no screen wake. Normal alarms return by themselves.'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.timer_outlined),
+              title: const Text('1 hour'),
+              onTap: () => Navigator.pop(c, 60),
+            ),
+            ListTile(
+              leading: const Icon(Icons.timer_outlined),
+              title: const Text('2 hours'),
+              onTap: () => Navigator.pop(c, 120),
+            ),
+            ListTile(
+              leading: const Icon(Icons.today_outlined),
+              title: const Text('Rest of today (until midnight)'),
+              onTap: () => Navigator.pop(c, -1),
+            ),
+            if (isMuted)
+              ListTile(
+                leading: const Icon(Icons.volume_up),
+                title: const Text('Turn mute off'),
+                onTap: () => Navigator.pop(c, 0),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null) return;
+    final now = DateTime.now();
+    DateTime? until;
+    if (choice == -1) {
+      until = DateTime(now.year, now.month, now.day + 1);
+    } else if (choice > 0) {
+      until = now.add(Duration(minutes: choice));
+    }
+    await setMuteUntil(until);
+    if (!mounted) return;
+    setState(() {});
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(until == null
+          ? 'Mute is off'
+          : 'Silent until ${_hhmm(until)}'),
+    ));
+  }
+
+  Future<void> _preSheet() async {
+    final v = await showDialog<int>(
+      context: context,
+      builder: (c) => SimpleDialog(
+        title: const Text('Gentle reminder before each prayer'),
+        children: [
+          for (final m in const [0, 5, 10, 15])
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(c, m),
+              child: Row(
+                children: [
+                  Expanded(
+                      child: Text(m == 0 ? 'Off' : '$m minutes before')),
+                  if (m == preAlarmMinutes) const Icon(Icons.check, size: 20),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (v == null) return;
+    await setPreAlarm(v);
+    if (mounted) setState(() {});
   }
 
   Widget _prayerCard(Prayer p, bool isNext, ColorScheme scheme) {
@@ -1538,6 +2049,8 @@ class _HomeState extends State<Home> with WindowListener, TrayListener {
         padding: const EdgeInsets.all(12),
         children: [
           _nextCard(next, scheme),
+          _dots(),
+          _controls(),
           const SizedBox(height: 4),
           for (final p in prayers)
             _prayerCard(p, next?.prayer.id == p.id, scheme),
